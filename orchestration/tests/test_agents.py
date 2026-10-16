@@ -547,6 +547,19 @@ class _FakeCopilotFatalProc(_FakeProc):
         return ("", "")
 
 
+class _FakeCopilotOutputProc(_FakeProc):
+    def __init__(self, stdout_handle, message="done"):
+        super().__init__()
+        self._stdout_handle = stdout_handle
+        self._message = message
+
+    def communicate(self, timeout=None):
+        self.communicate_timeouts.append(timeout)
+        self._stdout_handle.write(f"{self._message}\n")
+        self._stdout_handle.flush()
+        return ("", "")
+
+
 def test_capture_provider_context_copies_cline_task_files_to_central_store(workspace, tmp_path, monkeypatch):
     cline_home = tmp_path / ".cline"
     tasks_dir = cline_home / "data" / "tasks"
@@ -1265,6 +1278,12 @@ def test_run_agent_prompt_uses_current_python_executable(mock_popen, mock_which,
 
     prompt = cmd[cmd.index("-p") + 1]
     assert f"Read the task details with: {expected} task read {task.id}" in prompt
+    lock_note = (
+        "The orchestration system has already locked any tasks it has provided you with, "
+        "and will release those locks when you complete your work. Do NOT attempt to lock "
+        "or unlock tasks yourself."
+    )
+    assert prompt.count(lock_note) == 1
 
     system_prompt = cmd[cmd.index("--append-system-prompt") + 1]
     assert f"CLI command: {expected} <command>" in system_prompt
@@ -1293,6 +1312,12 @@ def test_run_agent_reads_multiple_tasks_in_one_ordered_command(mock_popen, mock_
     assert prompt.count("valid next:") == 0
     assert prompt.count("Valid next states for assigned task statuses:") == 1
     assert prompt.count(f"{first.status} ->") == 1
+    lock_note = (
+        "The orchestration system has already locked any tasks it has provided you with, "
+        "and will release those locks when you complete your work. Do NOT attempt to lock "
+        "or unlock tasks yourself."
+    )
+    assert prompt.count(lock_note) == 1
 
 
 @patch("orchestration.agents.shutil.which", return_value="/usr/bin/claude")
@@ -2045,6 +2070,142 @@ def test_run_agent_can_use_copilot_runtime(mock_popen, mock_which, workspace):
     latest = runs[0]
     assert latest["runtime"] == "copilot"
     assert latest["command_line"].startswith("/usr/bin/copilot ")
+
+
+@patch("orchestration.agents.shutil.which", return_value="/usr/bin/copilot")
+@patch("orchestration.agents.subprocess.Popen")
+def test_run_agent_routes_ollama_provider_through_copilot(mock_popen, mock_which, workspace, monkeypatch):
+    monkeypatch.setenv("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OLLAMA_DEFAULT_MODEL", "gemma4:latest")
+    monkeypatch.setenv("ORCHESTRATION_AGENT_RUNTIME", "claude-code")
+    monkeypatch.setenv("BEANS_PROXY", "true")
+
+    agents_dir = os.path.join(workspace, "Agents")
+    with open(os.path.join(agents_dir, "ollama_agent.md"), "w", encoding="utf-8") as f:
+        f.write(
+            "---\n"
+            "name: Ollama Agent\n"
+            "description: Runs locally through Ollama\n"
+            "x-provider: ollama\n"
+            "---\n"
+            "You are provider-aware.\n"
+        )
+
+    ws = create_workstream(name="Local WS", base_dir=workspace)
+    task = create_task(ws.id, title="Run Locally", base_dir=workspace)
+    mock_popen.side_effect = lambda *args, **kwargs: _FakeCopilotOutputProc(kwargs["stdout"])
+
+    run_agent("Ollama Agent", task_ids=[task.id], workstream_id=ws.id, base_dir=workspace)
+
+    child_env = mock_popen.call_args.kwargs["env"]
+    assert child_env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:11434/v1"
+    assert child_env["COPILOT_PROVIDER_TYPE"] == "openai"
+    assert child_env["COPILOT_PROVIDER_API_KEY"] == "ollama"
+    assert child_env["COPILOT_MODEL"] == "gemma4:latest"
+
+    cmd = mock_popen.call_args.args[0]
+    assert cmd[0] == "/usr/bin/copilot"
+    assert cmd[cmd.index("--model") + 1] == "gemma4:latest"
+
+    latest = list_agent_runs(limit=5, base_dir=workspace)[0]
+    assert latest["runtime"] == "copilot"
+    assert latest["provider"] == "ollama"
+    assert "beans_proxy" not in latest
+
+
+@patch("orchestration.agents.shutil.which", return_value="/usr/bin/copilot")
+@patch("orchestration.agents.subprocess.Popen")
+def test_run_agent_ollama_provider_allows_model_override(mock_popen, mock_which, workspace, monkeypatch):
+    monkeypatch.setenv("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OLLAMA_DEFAULT_MODEL", "default-local-model")
+
+    agents_dir = os.path.join(workspace, "Agents")
+    with open(os.path.join(agents_dir, "ollama_override_agent.md"), "w", encoding="utf-8") as f:
+        f.write(
+            "---\n"
+            "name: Ollama Override Agent\n"
+            "description: Overrides the local model\n"
+            "x-provider: ollama\n"
+            "x-model: gemma4:latest\n"
+            "---\n"
+            "You are provider-aware.\n"
+        )
+
+    ws = create_workstream(name="Local WS", base_dir=workspace)
+    mock_popen.side_effect = lambda *args, **kwargs: _FakeCopilotOutputProc(kwargs["stdout"])
+    run_agent("Ollama Override Agent", workstream_id=ws.id, base_dir=workspace)
+
+    cmd = mock_popen.call_args.args[0]
+    assert cmd[cmd.index("--model") + 1] == "gemma4:latest"
+
+
+@patch("orchestration.agents.shutil.which", return_value="/usr/bin/copilot")
+@patch("orchestration.agents.subprocess.Popen", return_value=_FakeProc())
+def test_run_agent_ollama_provider_rejects_empty_output(mock_popen, mock_which, workspace, monkeypatch):
+    monkeypatch.setenv("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OLLAMA_DEFAULT_MODEL", "gemma4:latest")
+
+    agents_dir = os.path.join(workspace, "Agents")
+    with open(os.path.join(agents_dir, "ollama_agent.md"), "w", encoding="utf-8") as f:
+        f.write(
+            "---\n"
+            "name: Ollama Agent\n"
+            "x-provider: ollama\n"
+            "---\n"
+            "You are provider-aware.\n"
+        )
+
+    ws = create_workstream(name="Local WS", base_dir=workspace)
+    with pytest.raises(RuntimeError, match=r"failed \(exit 0\)"):
+        run_agent("Ollama Agent", workstream_id=ws.id, base_dir=workspace)
+
+    latest = list_agent_runs(limit=1, base_dir=workspace)[0]
+    assert latest["status"] == "failed"
+    assert latest["output_bytes"] == 0
+
+
+@patch("orchestration.agents.subprocess.Popen", return_value=_FakeProc())
+def test_run_agent_ollama_provider_requires_default_model(mock_popen, workspace, monkeypatch):
+    monkeypatch.setenv("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.delenv("OLLAMA_DEFAULT_MODEL", raising=False)
+
+    agents_dir = os.path.join(workspace, "Agents")
+    with open(os.path.join(agents_dir, "ollama_missing_model_agent.md"), "w", encoding="utf-8") as f:
+        f.write(
+            "---\n"
+            "name: Ollama Missing Model Agent\n"
+            "x-provider: ollama\n"
+            "---\n"
+            "You are provider-aware.\n"
+        )
+
+    with pytest.raises(ValueError, match="OLLAMA_DEFAULT_MODEL"):
+        run_agent("Ollama Missing Model Agent", base_dir=workspace)
+
+    mock_popen.assert_not_called()
+
+
+@patch("orchestration.agents.shutil.which", return_value="/usr/bin/claude")
+@patch("orchestration.agents.subprocess.Popen", return_value=_FakeProc())
+def test_run_agent_ollama_provider_rejects_non_copilot_runtime(mock_popen, mock_which, workspace, monkeypatch):
+    monkeypatch.setenv("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OLLAMA_DEFAULT_MODEL", "gemma4:latest")
+
+    agents_dir = os.path.join(workspace, "Agents")
+    with open(os.path.join(agents_dir, "ollama_claude_agent.md"), "w", encoding="utf-8") as f:
+        f.write(
+            "---\n"
+            "name: Ollama Claude Agent\n"
+            "x-provider: ollama\n"
+            "x-runtime: claude-code\n"
+            "---\n"
+            "You are provider-aware.\n"
+        )
+
+    with pytest.raises(ValueError, match="supports only x-runtime 'copilot'"):
+        run_agent("Ollama Claude Agent", base_dir=workspace)
+
+    mock_popen.assert_not_called()
 
 
 @patch("orchestration.agents.shutil.which", return_value="/usr/bin/copilot")

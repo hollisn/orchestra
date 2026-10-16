@@ -37,6 +37,9 @@ class TestServerStartup:
             def shutdown(self):
                 pass
 
+            def server_close(self):
+                pass
+
         monkeypatch.setattr("workstream_manager.server.ThreadingHTTPServer", FakeServer)
         monkeypatch.setattr("workstream_manager.server.webbrowser.open", lambda url: opened.append(url) or True)
 
@@ -55,6 +58,9 @@ class TestServerStartup:
                 raise KeyboardInterrupt
 
             def shutdown(self):
+                pass
+
+            def server_close(self):
                 pass
 
         monkeypatch.setattr("workstream_manager.server.ThreadingHTTPServer", FakeServer)
@@ -1213,7 +1219,7 @@ class TestAgent:
         import workstream_manager.server as server
 
         orchestra_root = tmp_path / "orchestra"
-        external_agents = tmp_path / "foundation" / "Agents"
+        external_agents = tmp_path / "external-workspace" / "Agents"
         orchestra_root.mkdir()
         external_agents.mkdir(parents=True)
         definition = external_agents / "funding_researcher.md"
